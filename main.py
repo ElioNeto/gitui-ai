@@ -8,7 +8,7 @@ from textual.app import App, ComposeResult
 from textual.widgets import (
     Header, Footer, Static, Button, Input, Label,
     ListView, ListItem, Log, TabbedContent, TabPane,
-    TextArea
+    TextArea, Select
 )
 from textual.containers import (
     Horizontal, Vertical, ScrollableContainer
@@ -21,13 +21,63 @@ from textual.binding import Binding
 import git
 import os
 import sys
+import json
 import httpx
 import asyncio
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+# ─────────────────── Persistência de configuração ──────────────────
+
+CONFIG_DIR  = Path.home() / ".config" / "gitui-ai"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+PROVIDERS = {
+    "groq":      {"env": "GROQ_API_KEY",      "label": "Groq (Llama 3.3 — GRATUITO)",       "url": "console.groq.com"},
+    "gemini":    {"env": "GEMINI_API_KEY",    "label": "Google Gemini 2.0 Flash (GRATUITO)", "url": "aistudio.google.com"},
+    "openai":    {"env": "OPENAI_API_KEY",    "label": "OpenAI GPT-4o-mini (pago)",          "url": "platform.openai.com"},
+    "anthropic": {"env": "ANTHROPIC_API_KEY", "label": "Anthropic Claude Haiku (pago)",      "url": "console.anthropic.com"},
+}
+
+
+def load_config() -> dict:
+    """Lê ~/.config/gitui-ai/config.json e injeta as keys no ambiente."""
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            for key, val in cfg.get("api_keys", {}).items():
+                if val and not os.environ.get(key):  # não sobrescreve .env
+                    os.environ[key] = val
+            return cfg
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(api_keys: dict) -> None:
+    """Salva as API keys em ~/.config/gitui-ai/config.json (permissão 600)."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {"api_keys": {k: v for k, v in api_keys.items() if v}}
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    CONFIG_FILE.chmod(0o600)  # somente dono pode ler/escrever
+    # injeta imediatamente no ambiente atual
+    for key, val in cfg["api_keys"].items():
+        os.environ[key] = val
+
+
+def get_active_provider() -> str | None:
+    """Retorna o nome do provedor ativo (primeiro com key configurada)."""
+    for name, info in PROVIDERS.items():
+        if os.getenv(info["env"]):
+            return name
+    return None
+
+
+# Carrega config persistida ANTES de qualquer coisa
+load_dotenv()   # .env do projeto (prioridade)
+load_config()   # ~/.config/gitui-ai/config.json (fallback)
+
 
 # ─────────────────── helpers git ──────────────────
 
@@ -49,20 +99,17 @@ def get_diff(repo, staged: bool = True) -> str:
 
 
 def get_project_context(repo) -> str:
-    ctx = []
     root = Path(repo.working_dir)
     for name in ["README.md", "README.rst", "pyproject.toml", "package.json", "Cargo.toml"]:
         f = root / name
         if f.exists():
-            ctx.append(f.read_text(errors="ignore")[:800])
-            break
-    return "\n".join(ctx)[:1200]
+            return f.read_text(errors="ignore")[:1200]
+    return ""
 
 
 # ─────────────────── IA commit (síncrono, chamado em thread) ──────────────────
 
 def ai_generate_commit_sync(diff: str, context: str) -> str:
-    """Wrapper síncrono — roda asyncio.run() em thread separada."""
     return asyncio.run(_ai_generate_commit_async(diff, context))
 
 
@@ -75,9 +122,8 @@ async def _ai_generate_commit_async(diff: str, context: str) -> str:
     if not any([groq_key, gemini_key, openai_key, anthropic_key]):
         return (
             "⚠️  Nenhuma API key configurada.\n"
-            "Opções GRATUITAS (sem cartão):\n"
-            "  GROQ_API_KEY   → console.groq.com\n"
-            "  GEMINI_API_KEY → aistudio.google.com"
+            "Pressione [K] para abrir as configurações e adicionar sua chave.\n"
+            "Opções GRATUITAS: Groq (console.groq.com) ou Gemini (aistudio.google.com)"
         )
 
     system_prompt = (
@@ -94,75 +140,51 @@ Git diff (staged):
 Generate the commit message:"""
 
     try:
-        # ── 1. Groq (GRATUITO) ──
         if groq_key:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {groq_key}"},
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "max_tokens": 200,
-                        "temperature": 0.3,
-                    },
+                    json={"model": "llama-3.3-70b-versatile",
+                          "messages": [{"role": "system", "content": system_prompt},
+                                       {"role": "user",   "content": user_prompt}],
+                          "max_tokens": 200, "temperature": 0.3},
                 )
                 r.raise_for_status()
                 return r.json()["choices"][0]["message"]["content"].strip()
 
-        # ── 2. Google Gemini (GRATUITO) ──
         elif gemini_key:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
                     f"gemini-2.0-flash:generateContent?key={gemini_key}",
-                    json={
-                        "contents": [{
-                            "parts": [{"text": system_prompt + "\n\n" + user_prompt}]
-                        }],
-                        "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3},
-                    },
+                    json={"contents": [{"parts": [{"text": system_prompt + "\n\n" + user_prompt}]}],
+                          "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3}},
                 )
                 r.raise_for_status()
                 return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-        # ── 3. OpenAI (pago) ──
         elif openai_key:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {openai_key}"},
-                    json={
-                        "model": "gpt-4o-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "max_tokens": 200,
-                        "temperature": 0.3,
-                    },
+                    json={"model": "gpt-4o-mini",
+                          "messages": [{"role": "system", "content": system_prompt},
+                                       {"role": "user",   "content": user_prompt}],
+                          "max_tokens": 200, "temperature": 0.3},
                 )
                 r.raise_for_status()
                 return r.json()["choices"][0]["message"]["content"].strip()
 
-        # ── 4. Anthropic (pago) ──
         elif anthropic_key:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post(
                     "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": anthropic_key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json={
-                        "model": "claude-3-haiku-20240307",
-                        "max_tokens": 200,
-                        "system": system_prompt,
-                        "messages": [{"role": "user", "content": user_prompt}],
-                    },
+                    headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"},
+                    json={"model": "claude-3-haiku-20240307", "max_tokens": 200,
+                          "system": system_prompt,
+                          "messages": [{"role": "user", "content": user_prompt}]},
                 )
                 r.raise_for_status()
                 return r.json()["content"][0]["text"].strip()
@@ -173,7 +195,68 @@ Generate the commit message:"""
     return "Nenhum provedor configurado."
 
 
-# ─────────────────── Modals ──────────────────
+# ─────────────────── Modal de Configuração ──────────────────
+
+class ConfigModal(ModalScreen):
+    """Modal para configurar e persistir as API keys."""
+    BINDINGS = [Binding("escape", "dismiss", "Fechar")]
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Container
+        with Container(id="config-modal"):
+            yield Label("⚙️  Configurações — API Keys", id="modal-title")
+            yield Static(
+                f"[dim]Salvo em: {CONFIG_FILE}[/dim]\n"
+                "[dim]As keys do .env têm prioridade sobre as salvas aqui.[/dim]",
+                id="config-info"
+            )
+
+            for provider, info in PROVIDERS.items():
+                current = os.getenv(info["env"], "")
+                masked = ("*" * 8 + current[-4:]) if len(current) > 8 else current
+                yield Static(f"[bold]{info['label']}[/bold] [dim]→ {info['url']}[/dim]",
+                             classes="provider-label")
+                yield Input(
+                    placeholder=f"Cole sua {info['env']} aqui...",
+                    value=masked if current else "",
+                    id=f"key-{provider}",
+                    password=False,
+                    classes="key-input"
+                )
+
+            with Horizontal(id="config-buttons"):
+                yield Button("💾 Salvar", variant="success", id="save-cfg-btn")
+                yield Button("🗑 Limpar tudo", variant="error", id="clear-cfg-btn")
+                yield Button("Cancelar", id="cancel-cfg-btn")
+
+    @on(Button.Pressed, "#save-cfg-btn")
+    def save(self):
+        api_keys = {}
+        for provider, info in PROVIDERS.items():
+            val = self.query_one(f"#key-{provider}", Input).value.strip()
+            # ignora se for o valor mascarado (não alterado)
+            if val and not (val.startswith("****") and len(val) == 12):
+                api_keys[info["env"]] = val
+            elif os.getenv(info["env"]):
+                # mantém o valor atual se não alterado
+                api_keys[info["env"]] = os.getenv(info["env"])
+        save_config(api_keys)
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#clear-cfg-btn")
+    def clear_all(self):
+        for provider, info in PROVIDERS.items():
+            self.query_one(f"#key-{provider}", Input).value = ""
+            os.environ.pop(info["env"], None)
+        save_config({})
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel-cfg-btn")
+    def cancel(self):
+        self.dismiss(False)
+
+
+# ─────────────────── Outros Modals ──────────────────
 
 class BranchModal(ModalScreen):
     BINDINGS = [Binding("escape", "dismiss", "Fechar")]
@@ -214,7 +297,7 @@ class RemoteModal(ModalScreen):
     @on(Button.Pressed, "#add-btn")
     def add_remote(self):
         name = self.query_one("#remote-name", Input).value.strip()
-        url = self.query_one("#remote-url", Input).value.strip()
+        url  = self.query_one("#remote-url",  Input).value.strip()
         if name and url:
             self.dismiss((name, url))
 
@@ -231,20 +314,21 @@ class GitUIApp(App):
     SUB_TITLE = "Git TUI com IA"
 
     BINDINGS = [
-        Binding("q", "quit", "Sair"),
-        Binding("r", "refresh", "Refresh"),
-        Binding("f5", "refresh", "Refresh", show=False),
+        Binding("q", "quit",         "Sair"),
+        Binding("r", "refresh",      "Refresh"),
+        Binding("f5","refresh",      "Refresh",    show=False),
         Binding("c", "focus_commit", "Commit"),
-        Binding("p", "git_push", "Push"),
-        Binding("u", "git_pull", "Pull"),
-        Binding("b", "new_branch", "Nova Branch"),
-        Binding("a", "stage_all", "Stage all"),
-        Binding("s", "ai_suggest", "Sugestão IA"),
+        Binding("p", "git_push",     "Push"),
+        Binding("u", "git_pull",     "Pull"),
+        Binding("b", "new_branch",   "Nova Branch"),
+        Binding("a", "stage_all",    "Stage all"),
+        Binding("s", "ai_suggest",   "Sugestão IA"),
+        Binding("k", "open_config",  "Config"),
         Binding("question_mark", "show_help", "Ajuda"),
     ]
 
     current_branch: reactive = reactive("")
-    ai_loading: reactive = reactive(False)
+    ai_loading:     reactive = reactive(False)
 
     def __init__(self, path: str = "."):
         super().__init__()
@@ -254,6 +338,7 @@ class GitUIApp(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="main-layout"):
+            # ─ Painel esquerdo ─
             with Vertical(id="left-panel"):
                 yield Static("📁 REPOSITÓRIO", classes="panel-title")
                 yield Static("", id="repo-info")
@@ -262,24 +347,27 @@ class GitUIApp(App):
                 yield Static("🔗 REMOTES", classes="panel-title")
                 yield ScrollableContainer(ListView(id="remote-list"), id="remote-scroll")
 
+            # ─ Painel central ─
             with Vertical(id="center-panel"):
                 with TabbedContent(id="main-tabs"):
                     with TabPane("📝 Staging", id="staging-tab"):
                         yield Static("UNSTAGED / UNTRACKED", classes="section-title")
                         yield ScrollableContainer(ListView(id="unstaged-list"), id="unstaged-scroll")
                         with Horizontal(id="staging-actions"):
-                            yield Button("+ Stage All", id="stage-all-btn", variant="success")
+                            yield Button("+ Stage All",   id="stage-all-btn",   variant="success")
                             yield Button("- Unstage All", id="unstage-all-btn", variant="warning")
                         yield Static("STAGED", classes="section-title")
                         yield ScrollableContainer(ListView(id="staged-list"), id="staged-scroll")
 
                     with TabPane("💬 Commit", id="commit-tab"):
+                        yield Static("", id="provider-status")
                         yield Static("Mensagem de commit (editável)", classes="section-title")
                         yield TextArea("", id="commit-msg")
                         with Horizontal(id="commit-actions"):
-                            yield Button("✨ Sugestão IA", id="ai-btn", variant="primary")
-                            yield Button("✔ Commit", id="commit-btn", variant="success")
-                            yield Button("🗑 Limpar", id="clear-btn")
+                            yield Button("✨ Sugestão IA", id="ai-btn",     variant="primary")
+                            yield Button("✔ Commit",       id="commit-btn", variant="success")
+                            yield Button("🗑 Limpar",        id="clear-btn")
+                            yield Button("⚙️ Config IA",    id="config-btn")
                         yield Static("", id="ai-status")
 
                     with TabPane("📜 Log", id="log-tab"):
@@ -290,19 +378,21 @@ class GitUIApp(App):
                     with TabPane("🔍 Diff", id="diff-tab"):
                         yield ScrollableContainer(Log(id="diff-view", auto_scroll=False), id="diff-scroll")
                         with Horizontal(id="diff-actions"):
-                            yield Button("Staged diff", id="staged-diff-btn", variant="primary")
+                            yield Button("Staged diff",  id="staged-diff-btn",  variant="primary")
                             yield Button("Working diff", id="working-diff-btn")
 
+            # ─ Painel direito ─
             with Vertical(id="right-panel"):
                 yield Static("⚡ AÇÕES RÁPIDAS", classes="panel-title")
                 with Vertical(id="quick-actions"):
-                    yield Button("⬆ Push", id="push-btn", variant="primary")
-                    yield Button("⬇ Pull", id="pull-btn", variant="primary")
-                    yield Button("🔀 Fetch", id="fetch-btn")
+                    yield Button("⬆ Push",        id="push-btn",       variant="primary")
+                    yield Button("⬇ Pull",        id="pull-btn",       variant="primary")
+                    yield Button("🔀 Fetch",       id="fetch-btn")
                     yield Button("🌿 Nova Branch", id="new-branch-btn")
-                    yield Button("🔗 Add Remote", id="add-remote-btn")
-                    yield Button("📦 Stash", id="stash-btn")
-                    yield Button("📤 Pop Stash", id="stash-pop-btn")
+                    yield Button("🔗 Add Remote",  id="add-remote-btn")
+                    yield Button("📦 Stash",       id="stash-btn")
+                    yield Button("📤 Pop Stash",   id="stash-pop-btn")
+                    yield Button("⚙️ Config IA",   id="config-side-btn")
                 yield Static("📊 STATUS", classes="panel-title")
                 yield ScrollableContainer(Log(id="status-log", auto_scroll=False), id="status-scroll")
 
@@ -310,6 +400,26 @@ class GitUIApp(App):
 
     def on_mount(self) -> None:
         self.refresh_all()
+        self._update_provider_status()
+        # Abre config automaticamente se nenhuma key estiver configurada
+        if not get_active_provider():
+            self.notify(
+                "⚠️ Nenhuma API key encontrada. Pressione [K] para configurar.",
+                severity="warning",
+                timeout=6,
+            )
+
+    def _update_provider_status(self):
+        provider = get_active_provider()
+        if provider:
+            label = PROVIDERS[provider]["label"]
+            status = f"[green]✓ IA ativa:[/green] {label}"
+        else:
+            status = "[red]✗ Nenhuma API key configurada — pressione K[/red]"
+        try:
+            self.query_one("#provider-status", Static).update(status)
+        except Exception:
+            pass
 
     def action_refresh(self) -> None:
         self.refresh_all()
@@ -334,7 +444,7 @@ class GitUIApp(App):
         self.current_branch = branch
         ahead = behind = 0
         try:
-            ahead = len(list(repo.iter_commits(f"origin/{branch}..HEAD")))
+            ahead  = len(list(repo.iter_commits(f"origin/{branch}..HEAD")))
             behind = len(list(repo.iter_commits(f"HEAD..origin/{branch}")))
         except Exception:
             pass
@@ -350,22 +460,18 @@ class GitUIApp(App):
     def _update_branches(self):
         lv = self.query_one("#branch-list", ListView)
         lv.clear()
-        if not self.repo:
-            return
         try:
             current = self.repo.active_branch.name
         except Exception:
             current = ""
         for b in self.repo.branches:
-            mark = "→ " if b.name == current else "  "
+            mark  = "→ " if b.name == current else "  "
             color = "green" if b.name == current else "white"
             lv.append(ListItem(Static(f"[{color}]{mark}{b.name}[/{color}]")))
 
     def _update_remotes(self):
         lv = self.query_one("#remote-list", ListView)
         lv.clear()
-        if not self.repo:
-            return
         for r in self.repo.remotes:
             lv.append(ListItem(Static(f"[cyan]{r.name}[/cyan] [dim]{r.url}[/dim]")))
         if not self.repo.remotes:
@@ -373,10 +479,8 @@ class GitUIApp(App):
 
     def _update_staging(self):
         repo = self.repo
-        if not repo:
-            return
         unstaged_lv = self.query_one("#unstaged-list", ListView)
-        staged_lv = self.query_one("#staged-list", ListView)
+        staged_lv   = self.query_one("#staged-list",   ListView)
         unstaged_lv.clear()
         staged_lv.clear()
         for item in repo.index.diff(None):
@@ -395,13 +499,11 @@ class GitUIApp(App):
     def _update_git_log(self):
         log_widget = self.query_one("#git-log", Log)
         log_widget.clear()
-        if not self.repo:
-            return
         try:
             for c in self.repo.iter_commits(max_count=50):
-                dt = datetime.fromtimestamp(c.committed_date).strftime("%d/%m %H:%M")
-                sha = c.hexsha[:7]
-                msg = c.message.splitlines()[0][:60]
+                dt     = datetime.fromtimestamp(c.committed_date).strftime("%d/%m %H:%M")
+                sha    = c.hexsha[:7]
+                msg    = c.message.splitlines()[0][:60]
                 author = c.author.name[:15]
                 log_widget.write_line(f"[yellow]{sha}[/yellow] [dim]{dt}[/dim] [cyan]{author:<15}[/cyan] {msg}")
         except Exception as e:
@@ -410,8 +512,6 @@ class GitUIApp(App):
     def _update_status(self):
         status_log = self.query_one("#status-log", Log)
         status_log.clear()
-        if not self.repo:
-            return
         try:
             status = self.repo.git.status("--short")
             for line in status.splitlines():
@@ -427,6 +527,21 @@ class GitUIApp(App):
                 status_log.write_line("[dim]✓ Working tree limpo[/dim]")
         except Exception as e:
             status_log.write_line(f"[red]{e}[/red]")
+
+    # ── Config ──
+
+    def action_open_config(self) -> None:
+        self.push_screen(ConfigModal(), self._on_config_saved)
+
+    @on(Button.Pressed, "#config-btn")
+    @on(Button.Pressed, "#config-side-btn")
+    def _open_config_modal(self) -> None:
+        self.push_screen(ConfigModal(), self._on_config_saved)
+
+    def _on_config_saved(self, saved: bool) -> None:
+        if saved:
+            self.notify("✅ Configurações salvas!", severity="information")
+            self._update_provider_status()
 
     # ── Staging ──
 
@@ -481,7 +596,7 @@ class GitUIApp(App):
         except Exception as e:
             self.notify(f"Erro no commit: {e}", severity="error")
 
-    # ── IA (thread worker — evita conflito com event loop do Textual) ──
+    # ── IA ──
 
     def action_ai_suggest(self) -> None:
         self.query_one("#main-tabs").active = "commit-tab"
@@ -499,16 +614,15 @@ class GitUIApp(App):
     def _ai_worker(self) -> None:
         if not self.repo:
             self.call_from_thread(
-                self.query_one("#ai-status", Static).update,
-                "[red]Sem repositório.[/red]"
+                self.query_one("#ai-status", Static).update, "[red]Sem repositório.[/red]"
             )
             self.ai_loading = False
             return
-        diff = get_diff(self.repo, staged=True)
+        diff    = get_diff(self.repo, staged=True)
         if not diff.strip() or diff.strip() == "\n":
             diff = get_diff(self.repo, staged=False)
         context = get_project_context(self.repo)
-        msg = ai_generate_commit_sync(diff, context)
+        msg     = ai_generate_commit_sync(diff, context)
         self.call_from_thread(self._apply_ai_msg, msg)
         self.ai_loading = False
 
@@ -519,7 +633,7 @@ class GitUIApp(App):
         )
         self.notify("✨ Mensagem gerada pela IA", severity="information")
 
-    # ── Push / Pull / Fetch (thread workers) ──
+    # ── Push / Pull / Fetch ──
 
     def action_git_push(self) -> None:
         self._do_push()
@@ -684,7 +798,8 @@ class GitUIApp(App):
 
     def action_show_help(self) -> None:
         self.notify(
-            "q=sair  r=refresh  c=commit  p=push  u=pull  b=branch  a=stage-all  s=IA  ?=ajuda",
+            "q=sair  r=refresh  c=commit  p=push  u=pull  "
+            "b=branch  a=stage-all  s=IA  k=config  ?=ajuda",
             severity="information",
             timeout=8,
         )
