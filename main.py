@@ -59,16 +59,14 @@ def get_project_context(repo) -> str:
     return "\n".join(ctx)[:1200]
 
 
-# ─────────────────── IA commit ──────────────────
+# ─────────────────── IA commit (síncrono, chamado em thread) ──────────────────
 
-async def ai_generate_commit(diff: str, context: str) -> str:
-    """
-    Suporta (em ordem de prioridade):
-      GROQ_API_KEY     → Llama 3.3 70B  — GRATUITO, sem cartão (console.groq.com)
-      GEMINI_API_KEY   → Gemini 2.0 Flash — GRATUITO, 1500 req/dia (aistudio.google.com)
-      OPENAI_API_KEY   → GPT-4o-mini       — pago
-      ANTHROPIC_API_KEY→ Claude Haiku      — pago
-    """
+def ai_generate_commit_sync(diff: str, context: str) -> str:
+    """Wrapper síncrono — roda asyncio.run() em thread separada."""
+    return asyncio.run(_ai_generate_commit_async(diff, context))
+
+
+async def _ai_generate_commit_async(diff: str, context: str) -> str:
     groq_key      = os.getenv("GROQ_API_KEY")
     gemini_key    = os.getenv("GEMINI_API_KEY")
     openai_key    = os.getenv("OPENAI_API_KEY")
@@ -96,7 +94,7 @@ Git diff (staged):
 Generate the commit message:"""
 
     try:
-        # ── 1. Groq (GRATUITO) — Llama 3.3 70B, ultrarrápido ──
+        # ── 1. Groq (GRATUITO) ──
         if groq_key:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
@@ -115,7 +113,7 @@ Generate the commit message:"""
                 r.raise_for_status()
                 return r.json()["choices"][0]["message"]["content"].strip()
 
-        # ── 2. Google Gemini (GRATUITO) — 1500 req/dia ──
+        # ── 2. Google Gemini (GRATUITO) ──
         elif gemini_key:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
@@ -336,10 +334,8 @@ class GitUIApp(App):
         self.current_branch = branch
         ahead = behind = 0
         try:
-            commits = list(repo.iter_commits(f"origin/{branch}..HEAD"))
-            ahead = len(commits)
-            commits = list(repo.iter_commits(f"HEAD..origin/{branch}"))
-            behind = len(commits)
+            ahead = len(list(repo.iter_commits(f"origin/{branch}..HEAD")))
+            behind = len(list(repo.iter_commits(f"HEAD..origin/{branch}")))
         except Exception:
             pass
         info = (
@@ -432,6 +428,8 @@ class GitUIApp(App):
         except Exception as e:
             status_log.write_line(f"[red]{e}[/red]")
 
+    # ── Staging ──
+
     def action_stage_all(self) -> None:
         self._stage_all()
 
@@ -457,6 +455,8 @@ class GitUIApp(App):
         except Exception as e:
             self.notify(f"Erro: {e}", severity="error")
 
+    # ── Commit ──
+
     def action_focus_commit(self) -> None:
         self.query_one("#main-tabs").active = "commit-tab"
         self.query_one("#commit-msg", TextArea).focus()
@@ -481,6 +481,8 @@ class GitUIApp(App):
         except Exception as e:
             self.notify(f"Erro no commit: {e}", severity="error")
 
+    # ── IA (thread worker — evita conflito com event loop do Textual) ──
+
     def action_ai_suggest(self) -> None:
         self.query_one("#main-tabs").active = "commit-tab"
         self._run_ai_suggest()
@@ -491,26 +493,33 @@ class GitUIApp(App):
             return
         self.ai_loading = True
         self.query_one("#ai-status", Static).update("[yellow]⏳ Consultando IA...[/yellow]")
-        self.run_worker(self._ai_worker(), exclusive=True)
+        self._ai_worker()
 
-    @work(exclusive=True)
-    async def _ai_worker(self) -> None:
+    @work(thread=True, exclusive=True)
+    def _ai_worker(self) -> None:
         if not self.repo:
-            self.call_from_thread(self.query_one("#ai-status", Static).update, "[red]Sem repositório.[/red]")
+            self.call_from_thread(
+                self.query_one("#ai-status", Static).update,
+                "[red]Sem repositório.[/red]"
+            )
             self.ai_loading = False
             return
         diff = get_diff(self.repo, staged=True)
         if not diff.strip() or diff.strip() == "\n":
             diff = get_diff(self.repo, staged=False)
         context = get_project_context(self.repo)
-        msg = await ai_generate_commit(diff, context)
+        msg = ai_generate_commit_sync(diff, context)
         self.call_from_thread(self._apply_ai_msg, msg)
         self.ai_loading = False
 
     def _apply_ai_msg(self, msg: str) -> None:
         self.query_one("#commit-msg", TextArea).text = msg
-        self.query_one("#ai-status", Static).update("[green]✅ Sugestão aplicada! Revise e edite antes de commitar.[/green]")
+        self.query_one("#ai-status", Static).update(
+            "[green]✅ Sugestão aplicada! Revise e edite antes de commitar.[/green]"
+        )
         self.notify("✨ Mensagem gerada pela IA", severity="information")
+
+    # ── Push / Pull / Fetch (thread workers) ──
 
     def action_git_push(self) -> None:
         self._do_push()
@@ -519,10 +528,10 @@ class GitUIApp(App):
     def _do_push(self) -> None:
         if not self.repo:
             return
-        self.run_worker(self._push_worker(), exclusive=True)
+        self._push_worker()
 
-    @work(exclusive=True)
-    async def _push_worker(self) -> None:
+    @work(thread=True, exclusive=True)
+    def _push_worker(self) -> None:
         self.call_from_thread(self.notify, "⬆ Fazendo push...", severity="information")
         try:
             self.repo.remote("origin").push()
@@ -538,10 +547,10 @@ class GitUIApp(App):
     def _do_pull(self) -> None:
         if not self.repo:
             return
-        self.run_worker(self._pull_worker(), exclusive=True)
+        self._pull_worker()
 
-    @work(exclusive=True)
-    async def _pull_worker(self) -> None:
+    @work(thread=True, exclusive=True)
+    def _pull_worker(self) -> None:
         self.call_from_thread(self.notify, "⬇ Fazendo pull...", severity="information")
         try:
             self.repo.remote("origin").pull()
@@ -554,10 +563,10 @@ class GitUIApp(App):
     def _do_fetch(self) -> None:
         if not self.repo:
             return
-        self.run_worker(self._fetch_worker(), exclusive=True)
+        self._fetch_worker()
 
-    @work(exclusive=True)
-    async def _fetch_worker(self) -> None:
+    @work(thread=True, exclusive=True)
+    def _fetch_worker(self) -> None:
         self.call_from_thread(self.notify, "🔀 Fazendo fetch...", severity="information")
         try:
             for remote in self.repo.remotes:
@@ -566,6 +575,8 @@ class GitUIApp(App):
         except Exception as e:
             self.call_from_thread(self.notify, f"Erro fetch: {e}", severity="error")
         self.call_from_thread(self.refresh_all)
+
+    # ── Diff ──
 
     @on(Button.Pressed, "#staged-diff-btn")
     def show_staged_diff(self) -> None:
@@ -609,6 +620,8 @@ class GitUIApp(App):
         except Exception as e:
             diff_view.write_line(f"[red]{e}[/red]")
 
+    # ── Branch / Remote ──
+
     def action_new_branch(self) -> None:
         self.push_screen(BranchModal(), self._on_branch_created)
 
@@ -639,6 +652,8 @@ class GitUIApp(App):
             except Exception as e:
                 self.notify(f"Erro: {e}", severity="error")
 
+    # ── Stash ──
+
     @on(Button.Pressed, "#stash-btn")
     def _do_stash(self) -> None:
         if not self.repo:
@@ -660,6 +675,8 @@ class GitUIApp(App):
             self.refresh_all()
         except Exception as e:
             self.notify(f"Erro: {e}", severity="error")
+
+    # ── Log / Help ──
 
     @on(Button.Pressed, "#refresh-log-btn")
     def refresh_log(self) -> None:
