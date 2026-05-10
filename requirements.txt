@@ -1,0 +1,4 @@
+textual>=0.47.0
+gitpython>=3.1.0
+httpx>=0.26.0
+python-dotenv>=1.0.0

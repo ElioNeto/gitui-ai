@@ -1,0 +1,187 @@
+/* ══ GitUI-AI — Textual CSS ══ */
+
+Screen {
+    background: #0d0d0d;
+}
+
+Header {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    height: 3;
+}
+
+Footer {
+    background: #1a1a2e;
+    color: #888888;
+}
+
+#main-layout {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#left-panel {
+    width: 24;
+    background: #111118;
+    border-right: solid #2a2a3e;
+}
+
+#center-panel {
+    width: 1fr;
+    background: #0f0f1a;
+}
+
+#right-panel {
+    width: 22;
+    background: #111118;
+    border-left: solid #2a2a3e;
+}
+
+.panel-title {
+    background: #1e1e30;
+    color: #7c7cff;
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+}
+
+.section-title {
+    color: #555577;
+    padding: 0 1;
+    height: 1;
+    text-style: bold;
+}
+
+#repo-info {
+    padding: 1;
+    background: #0d0d18;
+    color: #ccccdd;
+    height: 6;
+}
+
+#branch-scroll {
+    height: 1fr;
+}
+
+#remote-scroll {
+    height: 6;
+}
+
+ListView {
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+ListItem {
+    padding: 0 1;
+    background: transparent;
+    height: 1;
+}
+
+ListItem:hover {
+    background: #1e1e30;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+TabPane {
+    padding: 0;
+    background: #0f0f1a;
+}
+
+#unstaged-scroll {
+    height: 1fr;
+}
+
+#staged-scroll {
+    height: 1fr;
+}
+
+Log {
+    background: #090910;
+    color: #ccccdd;
+    padding: 0 1;
+    scrollbar-color: #2a2a4e #0a0a18;
+}
+
+TextArea {
+    height: 1fr;
+    background: #0a0a16;
+    color: #e0e0ff;
+    border: solid #2a2a3e;
+}
+
+#staging-actions, #commit-actions, #log-actions, #diff-actions {
+    height: 3;
+    background: #0d0d18;
+    padding: 0 1;
+    align: left middle;
+}
+
+#quick-actions {
+    padding: 0;
+}
+
+#quick-actions Button {
+    width: 1fr;
+    height: 2;
+    margin: 0;
+    border: none;
+    background: #16162a;
+    color: #a0a0cc;
+}
+
+#quick-actions Button:hover {
+    background: #20203a;
+    color: #ffffff;
+    text-style: bold;
+}
+
+#status-scroll {
+    height: 1fr;
+}
+
+#ai-status {
+    height: 1;
+    padding: 0 1;
+}
+
+#modal-container {
+    width: 60;
+    height: auto;
+    background: #1a1a2e;
+    border: solid #4a4a7f;
+    padding: 2 3;
+    align: center middle;
+}
+
+#modal-title {
+    text-style: bold;
+    color: #a0a0ff;
+    margin-bottom: 1;
+}
+
+#modal-buttons {
+    margin-top: 1;
+    height: 3;
+    align: center middle;
+}
+
+#modal-buttons Button {
+    margin: 0 1;
+    min-width: 12;
+}
+
+Input {
+    background: #0d0d22;
+    border: solid #2a2a4e;
+    color: #e0e0ff;
+    margin-bottom: 1;
+}
+
+Input:focus {
+    border: solid #6060ff;
+}
